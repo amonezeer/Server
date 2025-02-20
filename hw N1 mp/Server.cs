@@ -1,136 +1,118 @@
 ﻿using System;
-using System.IO;
+using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
-using System.Threading;
-using System.Collections.Generic;
-using System.Text.Json;
 using System.Threading.Tasks;
-using System.Net.Http;
 
-class Server
+public class CurrencyExchangeServer
 {
-    private static readonly int port = 5000;
-    private static readonly string logFile = "server_log.txt";
-    private static readonly string apiUrl = "https://api.exchangerate-api.com/v4/latest/";
+    private TcpListener _tcpListener;
+    private const int MaxAttempts = 3;
+    private const int RetryTimeInSeconds = 60;
+    private Dictionary<IPEndPoint, int> _clientAttempts = new();
+    private Dictionary<IPEndPoint, DateTime> _blockedClients = new();
 
-    static async Task Main()
+    private readonly Dictionary<string, decimal> _rates = new()
     {
-        TcpListener listener = new TcpListener(IPAddress.Any, port);
-        listener.Start();
-        Console.WriteLine($"[Сервер] Запущен на порту {port}");
+        { "USD", 1.0m }, { "EUR", 0.85m }, { "UAH", 39.5m },
+        { "RUB", 90.0m }, { "PLN", 4.2m }, { "BYN", 3.3m },
+        { "GBP", 0.75m }, { "CNY", 7.1m }, { "JPY", 145.0m },
+        { "CAD", 1.3m }, { "AUD", 1.5m }, { "CHF", 0.91m }
+    };
+
+    public async Task StartAsync(string ipAddress, int port)
+    {
+        _tcpListener = new TcpListener(IPAddress.Parse(ipAddress), port);
+        _tcpListener.Start();
+        Console.WriteLine($"Сервер запущен на {ipAddress}:{port}");
 
         while (true)
         {
-            TcpClient client = await listener.AcceptTcpClientAsync();
-            Thread clientThread = new Thread(HandleClient!);
-            clientThread.Start(client);
+            TcpClient client = await _tcpListener.AcceptTcpClientAsync();
+            IPEndPoint clientEndPoint = (IPEndPoint)client.Client.RemoteEndPoint;
+            Console.WriteLine($"Клиент подключен: {clientEndPoint}");
+
+            _ = HandleClient(client);
         }
     }
 
-    private static async void HandleClient(object? obj)
+    private async Task HandleClient(TcpClient client)
     {
-        if (obj is not TcpClient client)
-            return;
-
-        NetworkStream stream = client.GetStream();
-        StreamReader reader = new StreamReader(stream, Encoding.UTF8);
-        StreamWriter writer = new StreamWriter(stream, Encoding.UTF8) { AutoFlush = true };
-
-        string clientEndPoint = client.Client.RemoteEndPoint?.ToString() ?? "Неизвестный клиент";
-        Log($"Подключился клиент {clientEndPoint}");
+        IPEndPoint clientEndPoint = (IPEndPoint)client.Client.RemoteEndPoint;
+        NetworkStream networkStream = client.GetStream();
+        byte[] buffer = new byte[1024];
+        int bytesRead;
 
         try
         {
-            while (true)
+            while ((bytesRead = await networkStream.ReadAsync(buffer, 0, buffer.Length)) > 0)
             {
-                string? request = await reader.ReadLineAsync();
-                if (string.IsNullOrWhiteSpace(request))
-                    break;
+                if (_blockedClients.TryGetValue(clientEndPoint, out DateTime blockTime) &&
+                    (DateTime.Now - blockTime).TotalSeconds < RetryTimeInSeconds)
+                {
+                    string blockMessage = "Заблокировано. Повторите через 1 минуту.";
+                    await networkStream.WriteAsync(Encoding.UTF8.GetBytes(blockMessage));
+                    return;
+                }
 
-                Console.WriteLine($"[Запрос] {clientEndPoint}: {request}");
+                string request = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+                Console.WriteLine($"Запрос от {clientEndPoint}: {request}");
 
-                string response = await ProcessRequest(request);
-                Log($"Запрос: {request} -> Ответ: {response}");
-                await writer.WriteLineAsync(response);
+                if (!_clientAttempts.ContainsKey(clientEndPoint))
+                    _clientAttempts[clientEndPoint] = 0;
+
+                if (_clientAttempts[clientEndPoint] >= MaxAttempts)
+                {
+                    _blockedClients[clientEndPoint] = DateTime.Now;
+                    string blockMessage = "Превышен лимит запросов. Попробуйте через 1 минуту.";
+                    await networkStream.WriteAsync(Encoding.UTF8.GetBytes(blockMessage));
+                    return;
+                }
+
+                _clientAttempts[clientEndPoint]++;
+                string response = ProcessRequest(request);
+                await networkStream.WriteAsync(Encoding.UTF8.GetBytes(response));
             }
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[Ошибка] {ex.Message}");
+            Console.WriteLine($"Ошибка: {ex.Message}");
         }
         finally
         {
             client.Close();
-            Log($"Клиент {clientEndPoint} отключился");
         }
     }
 
-    private static async Task<string> ProcessRequest(string request)
+    private string ProcessRequest(string request)
     {
         string[] parts = request.Split(' ');
-        if (parts.Length == 2)
+        if (parts.Length < 3) return "Ошибка: некорректный запрос.";
+
+        if (parts[0] == "CONVERT" && decimal.TryParse(parts[1], out decimal amount) &&
+            _rates.ContainsKey(parts[2]) && _rates.ContainsKey(parts[3]))
         {
-            return await GetExchangeRate(parts[0].ToUpper(), parts[1].ToUpper());
+            decimal result = amount * (_rates[parts[3]] / _rates[parts[2]]);
+            return $"Результат: {result:F2} {parts[3]}";
         }
-        else if (parts.Length == 3 && decimal.TryParse(parts[0], out decimal amount))
+
+        if (parts[0] == "RATE" && _rates.ContainsKey(parts[1]) && _rates.ContainsKey(parts[2]))
         {
-            return await ConvertCurrency(amount, parts[1].ToUpper(), parts[2].ToUpper());
+            decimal rate = _rates[parts[2]] / _rates[parts[1]];
+            return $"Курс {parts[1]} → {parts[2]}: {rate:F4}";
         }
-        else
-        {
-            return "Ошибка: Неправильный формат запроса, используйте 'USD EUR' или '100 USD EUR'";
-        }
+
+        return "Ошибка: неизвестный запрос.";
     }
+}
 
-    private static async Task<string> GetExchangeRate(string baseCurrency, string targetCurrency)
+// Запуск сервера
+class Program
+{
+    static async Task Main()
     {
-        try
-        {
-            using HttpClient httpClient = new HttpClient();
-            string url = $"{apiUrl}{baseCurrency}";
-            string json = await httpClient.GetStringAsync(url);
-
-            var data = JsonSerializer.Deserialize<JsonElement>(json);
-            if (!data.TryGetProperty("rates", out JsonElement rates) || !rates.TryGetProperty(targetCurrency, out JsonElement rate))
-                return "Ошибка: Валюта не найдена";
-
-            return $"{baseCurrency} -> {targetCurrency}: {rate.GetDecimal()}";
-        }
-        catch
-        {
-            return "Ошибка: Не удалось получить курс валют";
-        }
-    }
-
-    private static async Task<string> ConvertCurrency(decimal amount, string baseCurrency, string targetCurrency)
-    {
-        try
-        {
-            using HttpClient httpClient = new HttpClient();
-            string url = $"{apiUrl}{baseCurrency}";
-            string json = await httpClient.GetStringAsync(url);
-
-            var data = JsonSerializer.Deserialize<JsonElement>(json);
-            if (!data.TryGetProperty("rates", out JsonElement rates) || !rates.TryGetProperty(targetCurrency, out JsonElement rate))
-                return "Ошибка: Валюта не найдена";
-
-            decimal conversionRate = rate.GetDecimal();
-            decimal convertedAmount = amount * conversionRate;
-
-            return $"{amount} {baseCurrency} -> {convertedAmount:F2} {targetCurrency} (курс: {conversionRate})";
-        }
-        catch
-        {
-            return "Ошибка: Не удалось конвертировать валюту";
-        }
-    }
-
-    private static void Log(string message)
-    {
-        string logMessage = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {message}";
-        Console.WriteLine(logMessage);
-        File.AppendAllText(logFile, logMessage + Environment.NewLine);
+        var server = new CurrencyExchangeServer();
+        await server.StartAsync("127.0.0.1", 12345);
     }
 }
