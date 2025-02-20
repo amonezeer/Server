@@ -1,45 +1,47 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Net;
+using System.Net.Http;
 using System.Net.Sockets;
 using System.Text;
+using System.Text.Json;
 using System.Threading.Tasks;
 
 public class CurrencyExchangeServer
 {
     private TcpListener _tcpListener;
-    private const int MaxAttempts = 3;
+    private int _maxAttempts; // Теперь настраивается перед запуском
     private const int RetryTimeInSeconds = 60;
-    private Dictionary<IPEndPoint, int> _clientAttempts = new();
-    private Dictionary<IPEndPoint, DateTime> _blockedClients = new();
+    private Dictionary<string, int> _clientAttempts = new();
+    private Dictionary<string, DateTime> _blockedClients = new();
+    private Dictionary<string, decimal> _rates = new();
+    private const string ApiUrl = "https://api.exchangerate-api.com/v4/latest/USD";
 
-    private readonly Dictionary<string, decimal> _rates = new()
+    public CurrencyExchangeServer(int maxAttempts)
     {
-        { "USD", 1.0m }, { "EUR", 0.85m }, { "UAH", 39.5m },
-        { "RUB", 90.0m }, { "PLN", 4.2m }, { "BYN", 3.3m },
-        { "GBP", 0.75m }, { "CNY", 7.1m }, { "JPY", 145.0m },
-        { "CAD", 1.3m }, { "AUD", 1.5m }, { "CHF", 0.91m }
-    };
+        _maxAttempts = maxAttempts;
+    }
 
     public async Task StartAsync(string ipAddress, int port)
     {
         _tcpListener = new TcpListener(IPAddress.Parse(ipAddress), port);
         _tcpListener.Start();
-        Console.WriteLine($"Сервер запущен на {ipAddress}:{port}");
+        Console.WriteLine($"Сервер запущен на {ipAddress}:{port} | Макс. попыток: {_maxAttempts}");
+
+        await FetchExchangeRates();
 
         while (true)
         {
             TcpClient client = await _tcpListener.AcceptTcpClientAsync();
-            IPEndPoint clientEndPoint = (IPEndPoint)client.Client.RemoteEndPoint;
-            Console.WriteLine($"Клиент подключен: {clientEndPoint}");
+            string clientIp = ((IPEndPoint)client.Client.RemoteEndPoint).Address.ToString();
+            Console.WriteLine($"Клиент подключен: {clientIp}");
 
-            _ = HandleClient(client);
+            _ = HandleClient(client, clientIp);
         }
     }
 
-    private async Task HandleClient(TcpClient client)
+    private async Task HandleClient(TcpClient client, string clientIp)
     {
-        IPEndPoint clientEndPoint = (IPEndPoint)client.Client.RemoteEndPoint;
         NetworkStream networkStream = client.GetStream();
         byte[] buffer = new byte[1024];
         int bytesRead;
@@ -48,29 +50,42 @@ public class CurrencyExchangeServer
         {
             while ((bytesRead = await networkStream.ReadAsync(buffer, 0, buffer.Length)) > 0)
             {
-                if (_blockedClients.TryGetValue(clientEndPoint, out DateTime blockTime) &&
-                    (DateTime.Now - blockTime).TotalSeconds < RetryTimeInSeconds)
+                if (_blockedClients.TryGetValue(clientIp, out DateTime blockTime))
                 {
-                    string blockMessage = "Заблокировано. Повторите через 1 минуту.";
-                    await networkStream.WriteAsync(Encoding.UTF8.GetBytes(blockMessage));
-                    return;
+                    if ((DateTime.Now - blockTime).TotalSeconds < RetryTimeInSeconds)
+                    {
+                        Console.WriteLine($"Клиент {clientIp} всё ещё заблокирован.");
+                        string blockMessage = "Превышен лимит запросов. Повторите позже.";
+                        await networkStream.WriteAsync(Encoding.UTF8.GetBytes(blockMessage));
+                        return;
+                    }
+                    else
+                    {
+                        Console.WriteLine($"Клиент {clientIp} разблокирован.");
+                        _blockedClients.Remove(clientIp);
+                        _clientAttempts[clientIp] = 0;
+                    }
                 }
 
                 string request = Encoding.UTF8.GetString(buffer, 0, bytesRead);
-                Console.WriteLine($"Запрос от {clientEndPoint}: {request}");
+                Console.WriteLine($"Запрос от {clientIp}: {request}");
 
-                if (!_clientAttempts.ContainsKey(clientEndPoint))
-                    _clientAttempts[clientEndPoint] = 0;
+                if (!_clientAttempts.ContainsKey(clientIp))
+                    _clientAttempts[clientIp] = 0;
 
-                if (_clientAttempts[clientEndPoint] >= MaxAttempts)
+                if (_clientAttempts[clientIp] >= _maxAttempts)
                 {
-                    _blockedClients[clientEndPoint] = DateTime.Now;
+                    Console.WriteLine($"Клиент {clientIp} заблокирован за превышение попыток ({_maxAttempts}).");
+                    _blockedClients[clientIp] = DateTime.Now;
                     string blockMessage = "Превышен лимит запросов. Попробуйте через 1 минуту.";
                     await networkStream.WriteAsync(Encoding.UTF8.GetBytes(blockMessage));
                     return;
                 }
 
-                _clientAttempts[clientEndPoint]++;
+                _clientAttempts[clientIp]++;
+                int remainingAttempts = _maxAttempts - _clientAttempts[clientIp];
+                Console.WriteLine($"Клиент {clientIp} использовал {_clientAttempts[clientIp]} попыток. Осталось: {remainingAttempts}");
+
                 string response = ProcessRequest(request);
                 await networkStream.WriteAsync(Encoding.UTF8.GetBytes(response));
             }
@@ -82,6 +97,35 @@ public class CurrencyExchangeServer
         finally
         {
             client.Close();
+        }
+    }
+
+    private async Task FetchExchangeRates()
+    {
+        try
+        {
+            using HttpClient client = new();
+            string response = await client.GetStringAsync(ApiUrl);
+
+            if (string.IsNullOrWhiteSpace(response))
+            {
+                Console.WriteLine("Ошибка: пустой ответ от API.");
+                return;
+            }
+
+            using JsonDocument doc = JsonDocument.Parse(response);
+            if (!doc.RootElement.TryGetProperty("rates", out JsonElement ratesElement))
+            {
+                Console.WriteLine("Ошибка: не найден ключ 'rates' в JSON.");
+                return;
+            }
+
+            _rates = JsonSerializer.Deserialize<Dictionary<string, decimal>>(ratesElement.GetRawText()) ?? new();
+            Console.WriteLine("Курсы валют обновлены.");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Ошибка загрузки курса: {ex.Message}");
         }
     }
 
@@ -107,12 +151,19 @@ public class CurrencyExchangeServer
     }
 }
 
-// Запуск сервера
+// Запуск сервера с возможностью указания числа попыток
 class Program
 {
     static async Task Main()
     {
-        var server = new CurrencyExchangeServer();
+        Console.Write("Введите максимальное число попыток: ");
+        if (!int.TryParse(Console.ReadLine(), out int maxAttempts) || maxAttempts <= 0)
+        {
+            Console.WriteLine("Некорректный ввод. Устанавливаю значение по умолчанию: 3 попытки.");
+            maxAttempts = 3;
+        }
+
+        var server = new CurrencyExchangeServer(maxAttempts);
         await server.StartAsync("127.0.0.1", 12345);
     }
 }
